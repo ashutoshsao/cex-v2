@@ -86,6 +86,9 @@ function handleEngineRequest(message: EngineRequest): unknown {
       note: "Smoke-test response only. Students must replace this with real matching logic.",
     };
   }
+  else if (message.type === "get_user_balance"){
+    
+  }
 
   throw new Error("TODO(student): implement this engine request type");
 }
