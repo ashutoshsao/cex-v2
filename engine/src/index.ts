@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createClient } from "redis";
 import { env } from "./utils/env.js";
+import { BALANCES, FILLS, ORDERBOOKS, ORDERS, type CreateOrderInput, type Fill, type OrderRecord, type RestingOrder } from "./store/exchange-store.js";
 
 export type EngineCommandType =
   | "create_order"
@@ -68,27 +69,159 @@ function handleEngineRequest(message: EngineRequest): unknown {
 
   // just checking the flow, remove this when you start implementing the logic
   if (message.type === "create_order") {
-    return {
-      orderId: crypto.randomUUID(),
-      status: "filled",
-      filledQty: DUMMY_SELL_ORDER.qty,
-      averagePrice: DUMMY_SELL_ORDER.price,
-      fills: [
-        {
-          fillId: crypto.randomUUID(),
-          symbol: DUMMY_SELL_ORDER.symbol,
-          price: DUMMY_SELL_ORDER.price,
-          qty: DUMMY_SELL_ORDER.qty,
-          buyOrderId: "request-buy-order",
-          sellOrderId: DUMMY_SELL_ORDER.orderId,
-        },
-      ],
-      note: "Smoke-test response only. Students must replace this with real matching logic.",
-    };
+    const {userId, type, side, symbol, price, qty} = message.payload as unknown as CreateOrderInput;
+    let book = ORDERBOOKS.get(symbol);
+    //if not
+    if(!book){
+      book = {
+        asks: new Map<number,RestingOrder[]>(),
+        bids: new Map<number,RestingOrder[]>()
+      }
+      ORDERBOOKS.set(symbol,book);
+    }
+    const orderId = crypto.randomUUID();
+    if(type === "market"){
+      if(side === "buy"){
+        const sortedAsks:number[] = [...book.asks.keys()].sort((a,b)=>a - b);
+        if(!sortedAsks.length){
+          throw new Error("no_liquidity");
+        }
+        //try match
+        const balance = BALANCES.get(userId);
+        if(!balance){
+          BALANCES.set(userId,{
+            "USD":{
+              available:0,
+              locked:0
+            }
+          })
+        }
+        
+        //get locking price
+        let remainingQty = qty;
+        let totalCost = 0;
+        for(const askPrice of sortedAsks){
+          if(remainingQty <= 0)
+            break
+          let ordersAtPrice = book.asks.get(askPrice);
+          if(!ordersAtPrice) continue
+
+          for(const restingOrder of ordersAtPrice){
+            if(remainingQty <=0) break;
+
+            const restingRemainingQty = restingOrder.qty - restingOrder.filledQty;
+            const fillQty = Math.min(remainingQty,restingRemainingQty);
+
+            totalCost += fillQty * askPrice;
+            remainingQty -= fillQty;
+          }
+        }
+
+        //check user eligibility
+        const userBalances = BALANCES.get(userId);
+        const usdBalance = userBalances?.USD;
+
+        if(!usdBalance || usdBalance.available < totalCost){
+          throw new Error("insufficient_balance")
+        }
+        
+        //create market buy order
+        const buyOrder:OrderRecord = {
+          orderId: orderId,
+          userId: userId,
+          side: "buy",
+          type: "market",
+          symbol: symbol,
+          price: null,
+          qty: qty,
+          filledQty: 0,
+          status: "open",
+          fills:[],
+          createdAt: Date.now(),
+        }
+
+        // then loop again and actually:
+        // - update restingOrder.filledQty
+        // - create fills
+        // - update seller balances
+        // - remove filled resting orders
+        // - save incoming order in ORDERS
+        
+        //actual order matching
+        usdBalance.available -= totalCost;
+        remainingQty = qty;
+        totalCost = 0;
+        let filledQty = 0;
+        for(const askPrice of sortedAsks){
+          if(remainingQty <= 0) break;
+          let ordersAtPrice = book.asks.get(askPrice);
+          if(!ordersAtPrice) continue
+          
+          for(const restingOrder of ordersAtPrice){
+            if(remainingQty <=0) break;
+            
+            const restingRemainingQty = restingOrder.qty - restingOrder.filledQty;
+            const fillQty = Math.min(remainingQty,restingRemainingQty);
+            
+            restingOrder.filledQty += fillQty;
+            buyOrder.filledQty += fillQty;
+            remainingQty -= fillQty;
+            filledQty += fillQty;
+            //updating restingOrder object
+            if(restingOrder.qty === restingOrder.filledQty){
+              restingOrder.status = "filled";
+            } else {
+              restingOrder.status = "partially_filled";
+            }
+            
+            //creating fill and updating at all 3 places FILLS, buyerOrder.fills, sellerOrder.fills 
+            const fill : Fill={
+              fillId: crypto.randomUUID(),
+              symbol: symbol,
+              price: askPrice,
+              qty: fillQty,
+              buyOrderId: orderId,
+              sellOrderId: restingOrder.orderId,
+              createdAt: Date.now()
+            }
+
+            FILLS.push(fill);
+            buyOrder.fills.push(fill);
+            ORDERS.get(restingOrder.orderId)?.fills.push(fill);
+          }
+          
+          const remainingOrdersAtPrice = ordersAtPrice.filter((order)=>
+            order.filledQty < order.qty
+          )
+          
+          if(remainingOrdersAtPrice.length === 0){
+            book.asks.delete(askPrice);
+          }
+          else{
+            book.asks.set(askPrice,remainingOrdersAtPrice);
+          }
+        }
+
+        const savedOrder = ORDERS.get(orderId);
+        if (savedOrder) {
+          savedOrder.status = "partially_filled";
+        }
+      }
+      else{
+        const sortedBids = [...book.bids.keys()].sort((a, b) => b - a);
+
+        if (!sortedBids.length) {
+          throw new Error("no_liquidity");
+        }
+      }
+    }
   }
+  
   else if (message.type === "get_user_balance"){
     
   }
+
+  else if(message.type === "")
 
   throw new Error("TODO(student): implement this engine request type");
 }
